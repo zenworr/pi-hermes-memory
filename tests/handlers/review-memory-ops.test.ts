@@ -158,6 +158,54 @@ describe("provider auth resolution", () => {
     assert.strictEqual(usedKeys.length, 1, "an unchanged key means a real auth problem, not a rotation race");
   });
 
+  it("repairs malformed review JSON before falling back to a subprocess", async () => {
+    const { modelRegistry } = registryWithAuthResponses("current-key");
+    let completionCalls = 0;
+    const complete = async () => {
+      completionCalls++;
+      return completionCalls === 1
+        ? { stopReason: "stop", content: [{ type: "text", text: "I would save this, but the JSON is malformed: {operations: []}" }] }
+        : emptyOperations;
+    };
+
+    const result = await runDirectMemoryCompletion(
+      { model: mockModel(false), modelRegistry } as never,
+      null as never,
+      null,
+      directOptions(),
+      null,
+      null,
+      { completeSimple: complete as never },
+    );
+
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(result.fallbackReason, "empty");
+    assert.strictEqual(completionCalls, 2);
+  });
+
+  it("reports model stop errors instead of misclassifying them as parse errors", async () => {
+    const { modelRegistry } = registryWithAuthResponses("current-key");
+    const complete = async () => ({
+      stopReason: "error",
+      errorMessage: "provider stream failed",
+      content: [],
+    });
+
+    const result = await runDirectMemoryCompletion(
+      { model: mockModel(false), modelRegistry } as never,
+      null as never,
+      null,
+      directOptions(),
+      null,
+      null,
+      { completeSimple: complete as never },
+    );
+
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.fallbackReason, "provider_error");
+    assert.strictEqual(result.error, "provider stream failed");
+  });
+
   it("classifies provider auth rejections without swallowing other failures", () => {
     for (const message of [
       "HTTP 401 Unauthorized",
@@ -201,6 +249,16 @@ describe("parseReviewOperations", () => {
 
   it("returns null for invalid JSON", () => {
     assert.strictEqual(parseReviewOperations("not json at all"), null);
+  });
+
+  it("accepts a top-level operation array", () => {
+    const parsed = parseReviewOperations(JSON.stringify([
+      { action: "add", target: "memory", content: "uses pnpm" },
+    ]));
+
+    assert.deepStrictEqual(parsed, [
+      { action: "add", target: "memory", content: "uses pnpm" },
+    ]);
   });
 
   it("extracts JSON from fenced blocks", () => {

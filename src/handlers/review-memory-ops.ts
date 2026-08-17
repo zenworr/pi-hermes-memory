@@ -50,6 +50,11 @@ export function usesDirectTransport(config: Pick<MemoryConfig, "reviewTransport"
 
 type ReviewLlmConfig = Pick<MemoryConfig, "llmModelOverride" | "llmThinkingOverride">;
 
+const REVIEW_JSON_REPAIR_SYSTEM_PROMPT = `Convert the supplied memory-review response to valid JSON.
+Return only {"operations":[...]} using operations that are explicit in the response.
+Do not add or infer operations. If no valid operation is present, return {"operations":[]}.`;
+const REVIEW_JSON_REPAIR_MAX_CHARS = 20000;
+
 function findExactModelReferenceMatch(modelReference: string, availableModels: Model<Api>[]): Model<Api> | undefined {
   const trimmedReference = modelReference.trim();
   if (!trimmedReference) return undefined;
@@ -219,11 +224,11 @@ export function parseReviewOperations(text: string): ReviewMemoryOperation[] | n
   }
 
   const payload = extractJsonPayload(text);
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-    return null;
-  }
+  if (!payload || typeof payload !== "object") return null;
 
-  const operations = (payload as { operations?: unknown }).operations;
+  const operations = Array.isArray(payload)
+    ? payload
+    : (payload as { operations?: unknown }).operations;
   if (!Array.isArray(operations)) return null;
 
   const parsed: ReviewMemoryOperation[] = [];
@@ -439,41 +444,80 @@ export async function runDirectMemoryCompletion(
 
   const request = { systemPrompt: options.systemPrompt, messages: [userMessage] };
 
-  try {
-    let response;
+  const runCompletion = async (completionRequest: typeof request) => {
     try {
-      response = await complete(
+      return await complete(
         model,
-        request,
+        completionRequest,
         buildDirectReviewCompletionOptions(model, requestAuth, thinking, controller.signal),
       );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (controller.signal.aborted || !isAuthRejection(message)) throw err;
 
-      // The provider rejected the key mid-flight. A rotation tool may have
-      // re-resolve through Pi and retry once only if it returns a different
-      // key; otherwise this is a real auth problem and the subprocess
-      // fallback should handle it (#139).
+      // Re-resolve through Pi once so a rotated credential can replace the
+      // rejected key without reaching into provider internals (#139).
       const rotated = await resolveRequestAuth(ctx.modelRegistry, model);
       if (!rotated.ok || !rotated.apiKey || rotated.apiKey === requestAuth.apiKey) throw err;
 
       requestAuth = { apiKey: rotated.apiKey, headers: rotated.headers, env: rotated.env };
-      response = await complete(
+      return complete(
         model,
-        request,
+        completionRequest,
         buildDirectReviewCompletionOptions(model, requestAuth, thinking, controller.signal),
       );
     }
+  };
+
+  try {
+    let response = await runCompletion(request);
 
     if (response.stopReason === "aborted") {
       return { ok: false, appliedCount: 0, fallbackReason: "aborted" };
     }
+    if (response.stopReason === "error" || response.stopReason === "toolUse") {
+      return {
+        ok: false,
+        appliedCount: 0,
+        fallbackReason: "provider_error",
+        error: response.errorMessage || `Model stopped with ${response.stopReason}`,
+      };
+    }
 
-    const text = responseText(response.content);
-    const operations = parseReviewOperations(text);
+    let text = responseText(response.content);
+    let operations = parseReviewOperations(text);
+    if (operations === null && text.trim()) {
+      const repairText = text.length <= REVIEW_JSON_REPAIR_MAX_CHARS
+        ? text
+        : `${text.slice(0, REVIEW_JSON_REPAIR_MAX_CHARS / 2)}\n...\n${text.slice(-REVIEW_JSON_REPAIR_MAX_CHARS / 2)}`;
+      const repairMessage: Message = {
+        role: "user",
+        content: [{ type: "text", text: repairText }],
+        timestamp: Date.now(),
+      };
+      response = await runCompletion({
+        systemPrompt: REVIEW_JSON_REPAIR_SYSTEM_PROMPT,
+        messages: [repairMessage],
+      });
+      if (response.stopReason === "aborted") {
+        return { ok: false, appliedCount: 0, fallbackReason: "aborted" };
+      }
+      if (response.stopReason === "error" || response.stopReason === "toolUse") {
+        return {
+          ok: false,
+          appliedCount: 0,
+          fallbackReason: "provider_error",
+          error: response.errorMessage || `JSON repair stopped with ${response.stopReason}`,
+        };
+      }
+      text = responseText(response.content);
+      operations = parseReviewOperations(text);
+    }
     if (operations === null) {
-      return { ok: false, appliedCount: 0, fallbackReason: "parse_error" };
+      const reason = response.stopReason === "length"
+        ? "Model response reached its output limit before producing valid review JSON"
+        : "Model returned invalid review JSON after one repair attempt";
+      return { ok: false, appliedCount: 0, fallbackReason: "parse_error", error: reason };
     }
     if (operations.length === 0) {
       return { ok: true, appliedCount: 0, fallbackReason: "empty" };
