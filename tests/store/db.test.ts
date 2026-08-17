@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
+import { Worker } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 import { DatabaseManager, SQLITE_BUSY_TIMEOUT_MS, SQLITE_WAL_AUTOCHECKPOINT_PAGES } from '../../src/store/db.js';
 import { AtomicLockCoordinator } from '../../src/store/atomic-lock-coordinator.js';
@@ -840,6 +841,30 @@ describe('DatabaseManager', () => {
       });
 
       assert.doesNotThrow(() => dbManager.getDb());
+    });
+
+    it('keeps the event loop responsive while the startup integrity scan runs', async () => {
+      const delayedWorker = new Worker(`
+        const { parentPort } = require('node:worker_threads');
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150);
+        parentPort.postMessage({ status: 'ok' });
+      `, { eval: true });
+      const managerWithWorkerFactory = dbManager as unknown as {
+        createOpenIntegrityScanWorker: () => Worker;
+      };
+      managerWithWorkerFactory.createOpenIntegrityScanWorker = () => delayedWorker;
+
+      dbManager.getDb();
+      let scanFinished = false;
+      const scan = dbManager.waitForStartupIntegrityScan().then(() => {
+        scanFinished = true;
+      });
+
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+
+      assert.strictEqual(scanFinished, false);
+      assert.deepStrictEqual(dbManager.getStats(), { sessions: 0, messages: 0, memories: 0 });
+      await scan;
     });
 
     it('repairs recoverable corruption on open and preserves readable rows', async () => {

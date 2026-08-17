@@ -1,6 +1,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
+import { Worker } from 'node:worker_threads';
 import { SCHEMA_SQL } from './schema.js';
 import { AtomicLockCoordinator } from './atomic-lock-coordinator.js';
 import { canonicalStoragePathSync } from './canonical-storage-path.js';
@@ -28,6 +29,11 @@ type BunDatabaseInstance = {
   close: (throwOnError?: boolean) => void;
   transaction?: (fn: any) => any;
 };
+
+type OpenIntegrityScanResult =
+  | { status: 'ok' }
+  | { status: 'corrupt'; message: string }
+  | { status: 'error'; message: string; code?: string };
 
 type DatabaseFileSuffix = '' | '-wal' | '-shm';
 
@@ -103,6 +109,48 @@ const DEFAULT_RECOVERY_OPTIONS: ResolvedDatabaseRecoveryOptions = {
   recoveryBackupRetention: 3,
 };
 
+const OPEN_INTEGRITY_SCAN_WORKER_SOURCE = `
+'use strict';
+const { parentPort, workerData } = require('node:worker_threads');
+
+let db;
+let result;
+try {
+  let rows;
+  if (workerData.runtime === 'bun') {
+    const { Database } = require('bun:sqlite');
+    db = new Database(workerData.dbPath, { readonly: true, create: false });
+    db.exec('PRAGMA busy_timeout = ' + workerData.busyTimeoutMs);
+    rows = db.query('PRAGMA quick_check').all();
+  } else {
+    const Database = require(workerData.sqliteModulePath);
+    db = new Database(workerData.dbPath, {
+      readonly: true,
+      fileMustExist: true,
+      timeout: workerData.busyTimeoutMs,
+    });
+    rows = db.prepare('PRAGMA quick_check').all();
+  }
+
+  const details = rows.map((row) => String(Object.values(row)[0]));
+  result = details.length > 0 && details.every((value) => value.toLowerCase() === 'ok')
+    ? { status: 'ok' }
+    : { status: 'corrupt', message: details.slice(0, 5).join('; ') || 'no result' };
+} catch (error) {
+  result = {
+    status: 'error',
+    message: error instanceof Error ? error.message : String(error),
+    code: error && typeof error === 'object' && 'code' in error ? String(error.code) : undefined,
+  };
+} finally {
+  if (db) {
+    try { db.close(); } catch { /* best effort */ }
+  }
+}
+
+parentPort.postMessage(result);
+`;
+
 function quoteIdentifier(identifier: string): string {
   return `"${identifier.replace(/"/g, '""')}"`;
 }
@@ -163,6 +211,8 @@ export class DatabaseManager {
   private lastRecovery: DatabaseRecoveryResult | null = null;
   private openGuard: (() => void) | null = null;
   private pendingOpenIntegrityScan: Promise<void> | null = null;
+  private openIntegrityScanWorker: Worker | null = null;
+  private cancelPendingOpenIntegrityScan: (() => void) | null = null;
   private activeRecoveryLease: { coordinator: AtomicLockCoordinator; key: string; token: string } | null = null;
 
   constructor(memoryDir: string, recoveryOptions: DatabaseRecoveryOptions = {}) {
@@ -296,37 +346,88 @@ export class DatabaseManager {
   }
 
   /**
-   * quick_check walks the whole DB, so open() never pays that cost: the scan
-   * runs after open returns and failures go through the same recovery used
-   * at operation time.
+   * quick_check walks the whole DB, so it runs in a worker with its own
+   * read-only connection. The main event loop stays available to the TUI.
    */
   private scheduleOpenIntegrityScan(db: DatabaseLike): void {
     if (this.pendingOpenIntegrityScan) return;
+
+    let worker: Worker;
+    try {
+      worker = this.createOpenIntegrityScanWorker();
+    } catch {
+      return;
+    }
+
+    this.openIntegrityScanWorker = worker;
+    let settled = false;
+    let resolveScan = () => {};
     const scan = new Promise<void>((resolve) => {
-      setTimeout(() => {
-        try {
-          if (this.db !== db) {
-            // Manager closed or reopened; the newest open schedules its own
-            // scan, so skip to avoid a stale-handle recovery.
-            return;
-          }
-          this.assertIntegrityOk(db, 'quick_check', 'after open');
-        } catch (err) {
-          try {
-            this.recoverFromCorruption(err);
-          } catch {
-            // Best-effort here; at-operation withCorruptionRecovery still
-            // quarantines and rebuilds if a later statement hits the corruption.
-          }
-        } finally {
-          if (this.pendingOpenIntegrityScan === scan) {
-            this.pendingOpenIntegrityScan = null;
-          }
-          resolve();
-        }
-      }, 0);
+      resolveScan = resolve;
     });
+
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      worker.removeListener('message', onMessage);
+      worker.removeListener('error', onError);
+      worker.removeListener('exit', onExit);
+      if (this.openIntegrityScanWorker === worker) {
+        this.openIntegrityScanWorker = null;
+        this.cancelPendingOpenIntegrityScan = null;
+        this.pendingOpenIntegrityScan = null;
+      }
+      resolveScan();
+    };
+
+    const recover = (error: unknown): void => {
+      if (this.openIntegrityScanWorker !== worker || this.db !== db) return;
+      try {
+        this.recoverFromCorruption(error);
+      } catch {
+        // Best-effort here; at-operation recovery remains available.
+      }
+    };
+
+    const onMessage = (result: OpenIntegrityScanResult): void => {
+      if (result.status === 'corrupt') {
+        recover(new DatabaseCorruptionError(`SQLite quick_check failed after open: ${result.message}`));
+      } else if (result.status === 'error') {
+        const error = Object.assign(new Error(result.message), result.code ? { code: result.code } : {});
+        if (DatabaseManager.isCorruptionError(error)) recover(error);
+      }
+      finish();
+    };
+    const onError = (error: Error): void => {
+      if (DatabaseManager.isCorruptionError(error)) recover(error);
+      finish();
+    };
+    const onExit = (): void => finish();
+
+    this.cancelPendingOpenIntegrityScan = () => {
+      void worker.terminate().catch(() => {});
+      finish();
+    };
     this.pendingOpenIntegrityScan = scan;
+    worker.once('message', onMessage);
+    worker.once('error', onError);
+    worker.once('exit', onExit);
+    worker.unref();
+  }
+
+  private createOpenIntegrityScanWorker(): Worker {
+    const sqliteModulePath = isBunRuntime()
+      ? undefined
+      : createRequire(import.meta.url).resolve('better-sqlite3');
+    return new Worker(OPEN_INTEGRITY_SCAN_WORKER_SOURCE, {
+      eval: true,
+      workerData: {
+        dbPath: this.dbPath,
+        runtime: isBunRuntime() ? 'bun' : 'node',
+        sqliteModulePath,
+        busyTimeoutMs: SQLITE_BUSY_TIMEOUT_MS,
+      },
+    });
   }
 
   /** Test aid. */
@@ -1131,6 +1232,7 @@ export class DatabaseManager {
    * Close the database connection.
    */
   close(): void {
+    this.cancelPendingOpenIntegrityScan?.();
     if (this.db) {
       try { this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* best effort */ }
       try { this.db.close(); } catch { /* best effort — close may throw on a corrupt handle */ }
